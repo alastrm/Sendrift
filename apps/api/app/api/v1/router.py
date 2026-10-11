@@ -1,11 +1,13 @@
 """Version 1 API router."""
 from fastapi import APIRouter, Depends, Response
 
+from app.api.v1.shares import router as shares_router
 from app.schemas.health import HealthResponse, ReadinessResponse
 from app.services.health_service import HealthService
 from app.storage.s3 import S3StorageAdapter, get_storage
 
 api_v1_router = APIRouter(prefix="/api/v1", tags=["v1"])
+api_v1_router.include_router(shares_router)
 
 
 def get_health_service(

@@ -1,4 +1,18 @@
 """Storage adapter package."""
-from app.storage.s3 import S3StorageAdapter, get_storage
+from app.storage.s3 import (
+    EmptyFileError,
+    FileSizeLimitExceededError,
+    S3StorageAdapter,
+    StorageError,
+    StorageUnavailableError,
+    get_storage,
+)
 
-__all__ = ["S3StorageAdapter", "get_storage"]
+__all__ = [
+    "EmptyFileError",
+    "FileSizeLimitExceededError",
+    "S3StorageAdapter",
+    "StorageError",
+    "StorageUnavailableError",
+    "get_storage",
+]
