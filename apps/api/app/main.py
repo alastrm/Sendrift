@@ -11,6 +11,8 @@ from app.api.health import router as health_router
 from app.api.v1.router import api_v1_router
 from app.core.config import settings
 from app.core.logging import redact_url_path, setup_logging
+from app.core.upload_limits import UploadBodyLimitMiddleware
+from app.storage.s3 import get_storage
 
 logger = logging.getLogger("sendrift.api")
 
@@ -20,6 +22,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan context manager."""
     setup_logging(settings.LOG_LEVEL)
     logger.info("Sendrift API starting up (env=%s)...", settings.APP_ENV)
+    await get_storage().ensure_bucket()
     yield
     logger.info("Sendrift API shutting down...")
 
@@ -35,6 +38,11 @@ app = FastAPI(
 )
 
 # CORS Middleware with explicit origins from configuration
+app.add_middleware(
+    UploadBodyLimitMiddleware,
+    upload_path=f"{settings.API_V1_PREFIX}/shares",
+    max_body_bytes=settings.MAX_FILE_SIZE_BYTES + 5 * 1024 * 1024,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,

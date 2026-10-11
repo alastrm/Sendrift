@@ -38,6 +38,13 @@ async def create_share(
     ttl: str = Form(..., description="Retention TTL: '1h', '24h', or '7d'"),
     service: ShareService = Depends(get_share_service),
 ) -> ShareCreateResponse:
+    form = await request.form()
+    if len(form.getlist("file")) != 1 or len(form.getlist("ttl")) != 1 or set(form) != {
+        "file", "ttl",
+    }:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=400, detail="Exactly one file and one TTL are required")
     base_url = get_canonical_base_url(request)
     return await service.create_share(
         file=file,

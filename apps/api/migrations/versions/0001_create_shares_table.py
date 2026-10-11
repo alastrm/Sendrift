@@ -17,16 +17,12 @@ down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+share_status_enum = sa.Enum(
+    "uploading", "ready", "failed", "deleting", name="share_status"
+)
+
 
 def upgrade() -> None:
-    share_status_enum = postgresql.ENUM(
-        "uploading", "ready", "failed", "deleting", name="share_status", create_type=False
-    )
-    # Create enum type if on PostgreSQL
-    bind = op.get_bind()
-    if bind.dialect.name == "postgresql":
-        share_status_enum.create(bind, checkfirst=True)
-
     op.create_table(
         "shares",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -39,7 +35,7 @@ def upgrade() -> None:
         sa.Column("ttl_seconds", sa.Integer(), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("uploading", "ready", "failed", "deleting", name="share_status"),
+            share_status_enum,
             nullable=False,
             server_default="uploading",
         ),
@@ -105,7 +101,4 @@ def downgrade() -> None:
     op.drop_index("ix_shares_manage_token_hash", table_name="shares")
     op.drop_index("ix_shares_share_token_hash", table_name="shares")
     op.drop_table("shares")
-
-    bind = op.get_bind()
-    if bind.dialect.name == "postgresql":
-        sa.Enum(name="share_status").drop(bind, checkfirst=True)
+    share_status_enum.drop(op.get_bind(), checkfirst=True)

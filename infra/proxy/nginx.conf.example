@@ -15,6 +15,31 @@ http {
     # Allow maximum 105 MiB payload (100 MiB file limit + multipart boundary overhead)
     client_max_body_size 105M;
 
+    # Redact share tokens from request URI in access logs
+    # Matches /s/<share_token> and /api/v1/shares/<share_token>(/download)
+    # Preserves path structure and operational logging while masking sensitive tokens
+    map $request_uri $redacted_request_uri {
+        ~*^(/s/)[^/?#]+(.*)$                                              $1[REDACTED]$2;
+        ~*^(/api/v1/shares/)[^/?#]+(/[^?#]+)?([?#].*)?$                   $1[REDACTED]$2$3;
+        default                                                           $request_uri;
+    }
+
+    # Redact share tokens from Referer header if present
+    map $http_referer $redacted_referer {
+        ~*^(https?://[^/]+/s/|/s/)[^/?#]+(.*)$                            $1[REDACTED]$2;
+        ~*^(https?://[^/]+/api/v1/shares/|/api/v1/shares/)[^/?#]+(/[^?#]+)?([?#].*)?$ $1[REDACTED]$2$3;
+        default                                                           $http_referer;
+    }
+
+    # Custom access log format: logs redacted URI and redacted Referer.
+    # Management secrets (X-Manage-Token) and presigned tokens are never logged.
+    log_format redacted_combined '$remote_addr - $remote_user [$time_local] '
+                                 '"$request_method $redacted_request_uri $server_protocol" '
+                                 '$status $body_bytes_sent "$redacted_referer" '
+                                 '"$http_user_agent"';
+
+    access_log /var/log/nginx/access.log redacted_combined;
+
     upstream web_upstream {
         server web:3000;
     }

@@ -67,7 +67,12 @@ class Share(Base):
         nullable=False,
     )
     status: Mapped[ShareStatus] = mapped_column(
-        Enum(ShareStatus, name="share_status"),
+        Enum(
+            ShareStatus,
+            name="share_status",
+            values_callable=lambda obj: [e.value for e in obj],
+            create_type=False,
+        ),
         nullable=False,
         default=ShareStatus.UPLOADING,
     )
