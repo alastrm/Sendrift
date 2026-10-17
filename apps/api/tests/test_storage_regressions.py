@@ -135,6 +135,7 @@ def test_actual_sdk_multipart_is_serialized_and_aborts_on_overflow(oversized):
         stub.add_response("upload_part", {"ETag": "first"})
         if oversized:
             stub.add_response("abort_multipart_upload", {})
+            stub.add_response("list_multipart_uploads", {})
             stub.add_response("delete_object", {})
             with pytest.raises(FileSizeLimitExceededError):
                 storage._sync_put_stream("testing-key", source, part_size)

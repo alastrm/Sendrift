@@ -37,3 +37,22 @@ class ShareCreateResponse(BaseModel):
         ...,
         description="Expiration time in server UTC (ready_at + ttl)",
     )
+
+
+class ShareMetadataResponse(BaseModel):
+    """Response contract for retrieving share metadata (GET /api/v1/shares/{share_token})."""
+
+    filename: str = Field(
+        ...,
+        description="Original sanitized filename as metadata",
+    )
+    size_bytes: int = Field(
+        ...,
+        ge=1,
+        le=104857600,
+        description="Verified file size in bytes (1 to 104857600)",
+    )
+    expires_at: datetime = Field(
+        ...,
+        description="Expiration time in server UTC",
+    )

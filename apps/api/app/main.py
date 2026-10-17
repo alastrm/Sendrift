@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.api.health import router as health_router
 from app.api.v1.router import api_v1_router
@@ -47,8 +47,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Length", "Content-Type"],
 )
 
 
@@ -108,3 +109,13 @@ async def root():
         "status": "online",
         "documentation": "/docs" if settings.APP_ENV != "production" else "disabled",
     }
+
+
+@app.get("/s/{share_token}", include_in_schema=False)
+async def redirect_to_frontend_download(share_token: str) -> RedirectResponse:
+    """Redirect direct browser navigation on API port to frontend Next.js download page."""
+    web_base = str(settings.PUBLIC_WEB_URL).rstrip("/")
+    return RedirectResponse(
+        url=f"{web_base}/s/{share_token}",
+        status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+    )

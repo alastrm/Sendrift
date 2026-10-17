@@ -167,6 +167,8 @@ stateDiagram-v2
 5. После подтверждения `put` в storage выполнить DB transaction `uploading → ready`, установить `ready_at = now UTC` и `expires_at`.
 6. Лишь после DB commit вернуть `201` и секреты. Если commit упал, объект остаётся приватным и подлежит recovery; ссылку **не** выдавать как рабочую.
 
+После создания `uploading` API удерживает блокировку строки `FOR UPDATE` на время записи в S3 и до финализации. Cleanup пропускает эту строку через `SKIP LOCKED`, даже если загрузка длится дольше stale timeout. Финализация и отметка ошибки допускаются только из `uploading`; отмена запроса дожидается завершения блокирующего S3 thread перед освобождением блокировки/временного файла.
+
 Важно: FastAPI `UploadFile` уже может буферизовать тело запроса в память/временный диск. Поэтому размер HTTP тела, количество multipart полей, свободное место в tmp и таймауты также ограничены. `Content-Length` клиента недостаточен для валидации.
 
 ### Просмотр и скачивание
@@ -184,9 +186,12 @@ stateDiagram-v2
 - Worker запускается отдельно (например, контейнер, проверяющий задачи раз в минуту).
 - Выбирает истёкшие `ready`, `deleting`, достаточно старые `failed` и зависшие `uploading`.
 - Атомарно переводит подходящие записи в `deleting` (пакетная блокировка/`FOR UPDATE SKIP LOCKED` при нескольких worker), удаляет объект из S3, после подтверждения удаляет строку DB.
+- Commit перехода в `deleting` освобождает блокировку: worker повторно захватывает строку с `SKIP LOCKED` и удерживает её до завершения S3 delete и DB delete/commit. После crash остаётся `deleting`; другой worker может безопасно повторить удаление. Stale timeout и grace period отсчитываются от `updated_at`, не `created_at`.
 - При ошибке удаления сохраняет `deleting`, повторяет с backoff. Зависшие `deleting` всегда доступны recovery.
 - Повторное удаление отсутствующего объекта считается успешным завершением.
+- Перед удалением объекта storage adapter прерывает незавершённые multipart uploads с этим точным ключом. Для этого S3 credentials должны разрешать `ListBucketMultipartUploads` и `AbortMultipartUpload`. Reconciliation также проверяет старые multipart uploads без DB записей; недавние и связанные с активной записью сохраняются. Ошибка удаления отдельного ключа оставляет `deleting` и не блокирует остальные записи текущего ограниченного пакета.
 - Дополнительно нужен редкий audit/reconciliation для объектов с отсутствующими записями (например, crash после S3 put, но до commit/создания DB ссылки).
+- Reconciliation проходит все страницы S3 ограниченными пакетами, пропускает объекты моложе grace period (по умолчанию stale upload timeout) и повторно проверяет отсутствие DB записи перед удалением. API сохраняет DB запись до записи S3, а ключи не переиспользуются; отсутствие строки нельзя считать признаком orphan, используя только устаревший снимок.
 - Срок доступа проверяется API, поэтому задержка worker **не** продлевает публичную ссылку.
 
 ## 7. Security model
@@ -218,6 +223,22 @@ stateDiagram-v2
 ## 8. Deploy topology
 
 **Local development**: Docker Compose: `web`, `api`, `postgres`, `minio`, `worker`, опционально `proxy`. Бакет создаётся локальной командой и остаётся приватным. `.env.example` содержит лишь вымышленные значения. Реальный `.env` в `.gitignore`.
+
+Next.js проксирует `/api/*` и `/health/*` в FastAPI. `INTERNAL_API_URL` — серверный
+адрес, фиксируемый при `next build`: Compose передаёт build argument
+`http://api:8000`; вне Docker используется `http://localhost:8000` по умолчанию
+(override в `apps/web/.env.local`). Изменение только runtime environment готового
+standalone image не меняет rewrites: образ необходимо пересобрать. Браузер по
+умолчанию использует тот же origin; необязательный `NEXT_PUBLIC_API_URL` — отдельный
+публичный адрес, также фиксируемый при сборке JS, а не внутренний Docker hostname.
+
+API формирует публичные ссылки и redirects из настроенного `PUBLIC_WEB_URL`
+(по умолчанию `http://localhost:3000`, в production — реальный HTTPS origin).
+Заголовки `Host`, `X-Forwarded-Host`, `X-Forwarded-Proto` и `Forwarded` не являются
+источником публичного origin. Frontend не отправляет собственные forwarded headers.
+Worker использует общий API image, но не обслуживает HTTP: унаследованный HTTP
+healthcheck отключён в Compose. Это не проверка прогресса cleanup; его подтверждают
+логи завершённых циклов и наблюдение за удалением отозванных файлов.
 
 **Small production**: reverse proxy с TLS → Next.js и FastAPI → managed PostgreSQL и приватный S3-compatible bucket → тот же cleanup worker. Никакого публичного доступа к БД и S3 credentials в браузере. Статусные endpoints не раскрывают конфигурацию.
 

@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, HttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
     API_V1_PREFIX: str = "/api/v1"
+    PUBLIC_WEB_URL: HttpUrl = HttpUrl("http://localhost:3000")
 
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
@@ -39,6 +40,25 @@ class Settings(BaseSettings):
 
     # Business Constraints
     MAX_FILE_SIZE_BYTES: int = 104857600  # 100 MiB strict limit per specification
+
+    # Cleanup Worker Settings
+    CLEANUP_INTERVAL_SECONDS: int = 60
+    CLEANUP_STALE_UPLOAD_SECONDS: int = 3600  # 1 hour timeout for abandoned uploads
+    CLEANUP_STALE_FAILED_SECONDS: int = 3600  # 1 hour grace period for failed uploads
+    CLEANUP_BATCH_SIZE: int = 100
+
+    @field_validator("PUBLIC_WEB_URL")
+    @classmethod
+    def validate_public_web_origin(cls, value: HttpUrl) -> HttpUrl:
+        if (
+            value.username is not None
+            or value.password is not None
+            or value.path not in (None, "/")
+            or value.query is not None
+            or value.fragment is not None
+        ):
+            raise ValueError("PUBLIC_WEB_URL must be an HTTP(S) origin without credentials")
+        return value
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod

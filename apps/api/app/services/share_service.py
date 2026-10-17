@@ -2,16 +2,20 @@ import hashlib
 import logging
 import os
 import secrets
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, UploadFile, status
 
 from app.core.config import settings
+from app.models.share import Share, ShareStatus
 from app.repositories.share_repository import ShareRepository
-from app.schemas.share import TTL_SECONDS_MAP, ShareCreateResponse
+from app.schemas.share import TTL_SECONDS_MAP, ShareCreateResponse, ShareMetadataResponse
 from app.storage.s3 import (
     EmptyFileError,
     FileSizeLimitExceededError,
+    ObjectNotFoundError,
+    S3ObjectStream,
     S3StorageAdapter,
     StorageError,
     StorageUnavailableError,
@@ -19,6 +23,29 @@ from app.storage.s3 import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def hash_token(token: str) -> str:
+    """Compute SHA-256 hash of a raw token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def format_content_disposition(filename: str) -> str:
+    """Format RFC 6266 / RFC 5987 compliant Content-Disposition header safely."""
+    # Prevent header injection by removing newlines and control characters
+    safe_name = filename.replace("\r", "").replace("\n", "").replace("\x00", "").strip()
+    if not safe_name:
+        safe_name = "download"
+
+    # ASCII-safe fallback
+    ascii_name = safe_name.encode("ascii", "ignore").decode("ascii").strip()
+    ascii_name = ascii_name.replace("\\", "_").replace('"', '\\"')
+    if not ascii_name:
+        ascii_name = "download"
+
+    # RFC 5987 UTF-8 percent-encoding
+    encoded_utf8 = urllib.parse.quote(safe_name, safe="", encoding="utf-8")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_utf8}'
 
 
 def generate_tokens() -> tuple[str, str, str, str]:
@@ -84,6 +111,9 @@ class ShareService:
                 ttl_seconds=ttl_seconds,
                 content_type=content_type,
             )
+            share_id = share.id
+            if await self.share_repo.lock_uploading(share_id) is None:
+                raise RuntimeError("Upload record is no longer available")
         except Exception as exc:
             logger.error("Failed to initialize share record in DB: %s", type(exc).__name__)
             raise HTTPException(
@@ -100,26 +130,26 @@ class ShareService:
                 content_type="application/octet-stream",
             )
         except EmptyFileError:
-            await self.share_repo.mark_failed(share.id)
+            await self.share_repo.mark_failed(share_id)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="File is empty (0 bytes)",
             ) from None
         except FileSizeLimitExceededError:
-            await self.share_repo.mark_failed(share.id)
+            await self.share_repo.mark_failed(share_id)
             raise HTTPException(
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail="File size exceeds maximum allowed limit of 100 MiB",
             ) from None
         except (StorageUnavailableError, StorageError) as exc:
-            await self.share_repo.mark_failed(share.id)
+            await self.share_repo.mark_failed(share_id)
             logger.error("Storage failure during upload: %s", type(exc).__name__)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Storage service temporarily unavailable",
             ) from exc
         except Exception as exc:
-            await self.share_repo.mark_failed(share.id)
+            await self.share_repo.mark_failed(share_id)
             await self.storage.delete_object(object_key)
             logger.error("Unexpected failure during upload: %s", type(exc).__name__)
             raise HTTPException(
@@ -133,7 +163,7 @@ class ShareService:
 
         try:
             ready_share = await self.share_repo.mark_ready(
-                share_id=share.id,
+                share_id=share_id,
                 size_bytes=bytes_uploaded,
                 ready_at=now_utc,
                 expires_at=expires_at,
@@ -141,7 +171,7 @@ class ShareService:
             if not ready_share:
                 raise RuntimeError("Failed to transition share to ready")
         except Exception as exc:
-            logger.error("DB commit failed finalizing share %s: %s", share.id, type(exc).__name__)
+            logger.error("DB commit failed finalizing share %s: %s", share_id, type(exc).__name__)
             await self.storage.delete_object(object_key)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -159,3 +189,116 @@ class ShareService:
             size_bytes=bytes_uploaded,
             expires_at=expires_at,
         )
+
+    async def get_share_metadata(self, share_token: str) -> ShareMetadataResponse:
+        """Retrieve public metadata for an active ready share by share_token."""
+        token_hash = hash_token(share_token)
+        share = await self.share_repo.get_by_share_token_hash(token_hash)
+
+        if not share or share.status != ShareStatus.READY:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Share not found or expired",
+            )
+
+        now_utc = datetime.now(timezone.utc)
+        if share.expires_at is None or share.expires_at <= now_utc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Share not found or expired",
+            )
+
+        return ShareMetadataResponse(
+            filename=share.original_filename,
+            size_bytes=share.size_bytes or 0,
+            expires_at=share.expires_at,
+        )
+
+    async def get_share_for_download(
+        self,
+        share_token: str,
+        is_head_request: bool = False,
+    ) -> tuple[Share, S3ObjectStream]:
+        """Verify share access rules and acquire object stream."""
+        token_hash = hash_token(share_token)
+        share = await self.share_repo.get_by_share_token_hash(token_hash)
+
+        if not share or share.status != ShareStatus.READY:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Share not found or expired",
+            )
+
+        now_utc = datetime.now(timezone.utc)
+        if share.expires_at is None or share.expires_at <= now_utc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Share not found or expired",
+            )
+
+        try:
+            stream = await self.storage.get_stream(share.object_key)
+        except ObjectNotFoundError:
+            logger.error("Storage object missing for share %s", share.id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Share not found or expired",
+            ) from None
+        except (StorageUnavailableError, StorageError) as exc:
+            logger.error("Storage unavailable during download: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Storage service temporarily unavailable",
+            ) from exc
+
+        try:
+            if not is_head_request:
+                await self.share_repo.increment_download_count(share.id)
+            # Opening S3 may take time. Refresh the identity map and recheck
+            # revocation/expiry immediately before handing the stream to HTTP.
+            current_share = await self.share_repo.get_by_share_token_hash(token_hash)
+        except Exception as exc:
+            await stream.close()
+            logger.warning("Download authorization refresh failed: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Share service temporarily unavailable",
+            ) from None
+
+        if (
+            not current_share or current_share.status != ShareStatus.READY
+            or current_share.expires_at is None
+            or current_share.expires_at <= datetime.now(timezone.utc)
+        ):
+            await stream.close()
+            raise HTTPException(status_code=404, detail="Share not found or expired")
+        return current_share, stream
+
+    async def revoke_share(
+        self,
+        share_token: str,
+        manage_token: str,
+    ) -> dict[str, str]:
+        """Revoke share immediately upon owner request with valid manage_token."""
+        share_hash = hash_token(share_token)
+        share = await self.share_repo.get_by_share_token_hash(share_hash)
+
+        if not share:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Share not found or expired",
+            )
+
+        manage_hash = hash_token(manage_token)
+        if not secrets.compare_digest(share.manage_token_hash, manage_hash):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Share not found or expired",
+            )
+
+        # Idempotent: if already DELETING, return success 202
+        if share.status == ShareStatus.DELETING:
+            return {"detail": "Share deletion scheduled"}
+
+        await self.share_repo.mark_deleting(share.id)
+        return {"detail": "Share deletion scheduled"}

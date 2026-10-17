@@ -2,6 +2,8 @@ import asyncio
 import io
 import json
 import logging
+from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any, BinaryIO
 
 import boto3
@@ -32,6 +34,43 @@ class EmptyFileError(StorageError):
 class StorageUnavailableError(StorageError):
     """Raised when S3/MinIO service is unavailable."""
     pass
+
+
+class ObjectNotFoundError(StorageError):
+    """Raised when the requested object key does not exist in storage."""
+    pass
+
+
+class S3ObjectStream:
+    """Bounded streaming wrapper around S3 response body."""
+
+    def __init__(
+        self,
+        body: Any,
+        content_length: int | None = None,
+        content_type: str | None = None,
+    ) -> None:
+        self.body = body
+        self.content_length = content_length
+        self.content_type = content_type
+        self._closed = False
+
+    async def iter_bytes(self, chunk_size: int = 65536) -> AsyncIterator[bytes]:
+        """Asynchronously yield byte chunks via threadpool, guaranteeing body cleanup."""
+        try:
+            while True:
+                chunk = await asyncio.to_thread(self.body.read, chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await self.close()
+
+    async def close(self) -> None:
+        """Close the underlying response body and release the connection idempotently."""
+        if not self._closed:
+            self._closed = True
+            await asyncio.to_thread(self.body.close)
 
 
 class BoundedStreamReader(io.RawIOBase):
@@ -237,17 +276,75 @@ class S3StorageAdapter:
         content_type: str | None = None,
     ) -> int:
         """Asynchronously stream upload file to private bucket with bounded size limit."""
-        return await asyncio.to_thread(
+        transfer = asyncio.create_task(asyncio.to_thread(
             self._sync_put_stream,
             object_key,
             stream,
             max_size_bytes,
             content_type,
-        )
+        ))
+        try:
+            return await asyncio.shield(transfer)
+        except asyncio.CancelledError:
+            # A cancelled await cannot stop the SDK thread. Keep the caller's
+            # DB lock and spool alive until that thread has actually finished.
+            while not transfer.done():
+                try:
+                    await asyncio.shield(transfer)
+                except asyncio.CancelledError:
+                    continue
+                except Exception as exc:
+                    logger.warning("Cancelled upload ended with: %s", type(exc).__name__)
+            if not transfer.cancelled():
+                transfer.exception()  # Retrieve any failure before propagating cancellation.
+            raise
+
+    def _sync_get_stream(self, object_key: str) -> S3ObjectStream:
+        """Synchronously fetch S3 object streaming body and metadata."""
+        try:
+            resp = self._s3_client.get_object(Bucket=self.bucket_name, Key=object_key)
+            return S3ObjectStream(
+                body=resp["Body"],
+                content_length=resp.get("ContentLength"),
+                content_type=resp.get("ContentType"),
+            )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchKey", "404"):
+                raise ObjectNotFoundError(f"Object {object_key} not found") from exc
+            logger.error("S3 ClientError reading object %s: %s", object_key, code)
+            raise StorageUnavailableError("Object storage service is unavailable") from exc
+        except (EndpointConnectionError, Exception) as exc:
+            logger.error(
+                "Error connecting to S3 during get_stream %s: %s",
+                object_key,
+                type(exc).__name__,
+            )
+            raise StorageUnavailableError("Object storage service is unavailable") from exc
+
+    async def get_stream(self, object_key: str) -> S3ObjectStream:
+        """Asynchronously retrieve object stream from private bucket via threadpool."""
+        return await asyncio.to_thread(self._sync_get_stream, object_key)
 
     def _sync_delete_object(self, object_key: str) -> bool:
         """Synchronously delete an object; idempotent."""
         try:
+            # DeleteObject does not release unfinished multipart parts. A crash
+            # can leave these even when there is no completed object to delete.
+            pages = self._s3_client.get_paginator("list_multipart_uploads").paginate(
+                Bucket=self.bucket_name, Prefix=object_key,
+            )
+            for page in pages:
+                for upload in page.get("Uploads", []):
+                    if upload["Key"] != object_key:
+                        continue
+                    try:
+                        self._s3_client.abort_multipart_upload(
+                            Bucket=self.bucket_name, Key=object_key, UploadId=upload["UploadId"],
+                        )
+                    except ClientError as exc:
+                        if exc.response.get("Error", {}).get("Code") != "NoSuchUpload":
+                            raise
             self._s3_client.delete_object(Bucket=self.bucket_name, Key=object_key)
             return True
         except Exception as exc:
@@ -257,6 +354,50 @@ class S3StorageAdapter:
     async def delete_object(self, object_key: str) -> bool:
         """Asynchronously delete an object via threadpool."""
         return await asyncio.to_thread(self._sync_delete_object, object_key)
+
+    def _sync_list_object_keys(self, prefix: str = "", max_keys: int = 1000) -> list[str]:
+        """Synchronously list object keys in the bucket for audit/reconciliation."""
+        try:
+            paginator = self._s3_client.get_paginator("list_objects_v2")
+            keys: list[str] = []
+            for page in paginator.paginate(
+                Bucket=self.bucket_name,
+                Prefix=prefix,
+                PaginationConfig={"MaxItems": max_keys},
+            ):
+                for item in page.get("Contents", []):
+                    if "Key" in item:
+                        keys.append(item["Key"])
+            return keys
+        except Exception as exc:
+            logger.warning("Failed to list S3 objects: %s", type(exc).__name__)
+            return []
+
+    async def list_object_keys(self, prefix: str = "", max_keys: int = 1000) -> list[str]:
+        """Asynchronously list object keys in the bucket via threadpool."""
+        return await asyncio.to_thread(self._sync_list_object_keys, prefix, max_keys)
+
+    async def iter_object_key_batches(self, older_than: datetime) -> AsyncIterator[list[str]]:
+        """Scan old completed objects and unfinished multipart uploads in bounded pages."""
+        try:
+            for operation, entries, timestamp in (
+                ("list_objects_v2", "Contents", "LastModified"),
+                ("list_multipart_uploads", "Uploads", "Initiated"),
+            ):
+                pages = iter(self._s3_client.get_paginator(operation).paginate(
+                    Bucket=self.bucket_name, PaginationConfig={"PageSize": 1000},
+                ))
+                while (page := await asyncio.to_thread(next, pages, None)) is not None:
+                    keys = [
+                        item["Key"] for item in page.get(entries, [])
+                        if "Key" in item and item.get(timestamp) is not None
+                        and item[timestamp] < older_than
+                    ]
+                    if keys:
+                        yield keys
+        except Exception as exc:
+            logger.warning("S3 reconciliation listing failed: %s", type(exc).__name__)
+            raise StorageUnavailableError("Object listing unavailable") from None
 
 
 _storage_singleton: S3StorageAdapter | None = None

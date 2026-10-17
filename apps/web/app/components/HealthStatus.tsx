@@ -18,7 +18,7 @@ export default function HealthStatus() {
   const [data, setData] = useState<HealthState | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
 
   const checkHealth = useCallback(async () => {
     setLoading(true);
@@ -85,7 +85,7 @@ export default function HealthStatus() {
           </div>
           <div>
             <h3 className="font-semibold text-slate-100 text-sm">System Connectivity</h3>
-            <p className="text-xs text-slate-400">Target: <code className="text-slate-300 bg-slate-800 px-1 py-0.5 rounded">{apiUrl}</code></p>
+            <p className="text-xs text-slate-400">Target: <code className="text-slate-300 bg-slate-800 px-1 py-0.5 rounded">{apiUrl || "Same origin"}</code></p>
           </div>
         </div>
 

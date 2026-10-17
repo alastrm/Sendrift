@@ -488,5 +488,230 @@ async def test_share_url_structure():
 
         assert response.status_code == 201
         res = response.json()
-        assert res["share_url"].startswith("http://localhost:8000/s/")
+        assert res["share_url"].startswith(f"{str(settings.PUBLIC_WEB_URL).rstrip('/')}/s/")
         assert len(res["share_url"].split("/s/")[-1]) >= 42
+
+
+# ---------------------------------------------------------------------------
+# 6. Milestone 4 Real Retrieval & Download Flows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_real_upload_and_download_flow(db_conn):
+    """Complete roundtrip: upload file with Unicode name, get metadata, HEAD, and GET download."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
+        # Create a 256 KiB binary test payload with known hash
+        payload = b"A" * 1024 + b"B" * 2048 + b"\x00\xff\xfe\xfd" * 65536
+        expected_hash = hashlib.sha256(payload).hexdigest()
+        unicode_filename = "отчёт_за_2026_год.pdf"
+
+        files = {"file": (unicode_filename, payload, "application/pdf")}
+        data = {"ttl": "1h"}
+        upload_resp = await client.post("/api/v1/shares", files=files, data=data)
+
+        assert upload_resp.status_code == 201
+        upload_data = upload_resp.json()
+        share_url = upload_data["share_url"]
+        share_token = share_url.split("/s/")[-1]
+
+        # 1. Metadata endpoint GET /api/v1/shares/{share_token}
+        meta_resp = await client.get(f"/api/v1/shares/{share_token}")
+        assert meta_resp.status_code == 200
+        meta_data = meta_resp.json()
+        assert meta_data["filename"] == unicode_filename
+        assert meta_data["size_bytes"] == len(payload)
+        assert "expires_at" in meta_data
+        assert "manage_token" not in meta_data
+        assert "object_key" not in meta_data
+
+        # Verify initial download_count in DB is 0
+        cur = db_conn.cursor()
+        token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
+        cur.execute("SELECT download_count FROM shares WHERE share_token_hash = %s", (token_hash,))
+        initial_count = cur.fetchone()[0]
+        assert initial_count == 0
+        cur.close()
+
+        # 2. HEAD request: /api/v1/shares/{share_token}/download
+        head_resp = await client.head(f"/api/v1/shares/{share_token}/download")
+        assert head_resp.status_code == 200
+        assert head_resp.headers["content-type"] == "application/octet-stream"
+        assert head_resp.headers["content-length"] == str(len(payload))
+        assert head_resp.headers["x-content-type-options"] == "nosniff"
+        assert head_resp.headers["cache-control"] == "no-store"
+        assert head_resp.headers["referrer-policy"] == "no-referrer"
+        assert len(head_resp.content) == 0
+
+        # Verify HEAD did not increment download_count
+        cur = db_conn.cursor()
+        cur.execute("SELECT download_count FROM shares WHERE share_token_hash = %s", (token_hash,))
+        assert cur.fetchone()[0] == 0
+        cur.close()
+
+        # 3. GET download request: /api/v1/shares/{share_token}/download
+        get_resp = await client.get(f"/api/v1/shares/{share_token}/download")
+        assert get_resp.status_code == 200
+        assert get_resp.headers["content-type"] == "application/octet-stream"
+        assert get_resp.headers["content-length"] == str(len(payload))
+        assert get_resp.headers["x-content-type-options"] == "nosniff"
+        assert get_resp.headers["cache-control"] == "no-store"
+        assert get_resp.headers["referrer-policy"] == "no-referrer"
+
+        # Content-Disposition header checks
+        cd_header = get_resp.headers["content-disposition"]
+        assert "attachment;" in cd_header
+        assert "filename*=UTF-8''" in cd_header
+
+        # Verify byte-for-byte exact equality
+        downloaded_bytes = get_resp.content
+        assert len(downloaded_bytes) == len(payload)
+        assert hashlib.sha256(downloaded_bytes).hexdigest() == expected_hash
+
+        # Verify GET incremented download_count to 1
+        cur = db_conn.cursor()
+        cur.execute("SELECT download_count FROM shares WHERE share_token_hash = %s", (token_hash,))
+        assert cur.fetchone()[0] == 1
+        cur.close()
+
+
+@pytest.mark.asyncio
+async def test_real_download_expired_share(db_conn):
+    """Test that expired shares return 404 on both metadata and download."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
+        files = {"file": ("expires_soon.txt", b"temporary data", "text/plain")}
+        data = {"ttl": "1h"}
+        upload_resp = await client.post("/api/v1/shares", files=files, data=data)
+        assert upload_resp.status_code == 201
+        share_token = upload_resp.json()["share_url"].split("/s/")[-1]
+        token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
+
+        # Expire the share in the real PostgreSQL database
+        cur = db_conn.cursor()
+        cur.execute(
+            "UPDATE shares SET expires_at = NOW() - INTERVAL '1 minute' "
+            "WHERE share_token_hash = %s",
+            (token_hash,),
+        )
+        db_conn.commit()
+        cur.close()
+
+        # Both endpoints must return 404
+        meta_resp = await client.get(f"/api/v1/shares/{share_token}")
+        assert meta_resp.status_code == 404
+        assert meta_resp.json()["detail"] == "Share not found or expired"
+
+        down_resp = await client.get(f"/api/v1/shares/{share_token}/download")
+        assert down_resp.status_code == 404
+        assert down_resp.json()["detail"] == "Share not found or expired"
+
+
+@pytest.mark.asyncio
+async def test_real_download_non_ready_statuses(db_conn):
+    """Test that non-ready shares return neutral 404."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
+        files = {"file": ("pending.txt", b"waiting data", "text/plain")}
+        data = {"ttl": "1h"}
+        upload_resp = await client.post("/api/v1/shares", files=files, data=data)
+        assert upload_resp.status_code == 201
+        share_token = upload_resp.json()["share_url"].split("/s/")[-1]
+        token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
+
+        cur = db_conn.cursor()
+        for bad_status in ["failed", "uploading", "deleting"]:
+            cur.execute(
+                "UPDATE shares SET status = %s WHERE share_token_hash = %s",
+                (bad_status, token_hash),
+            )
+            db_conn.commit()
+
+            meta_resp = await client.get(f"/api/v1/shares/{share_token}")
+            assert meta_resp.status_code == 404
+            assert meta_resp.json()["detail"] == "Share not found or expired"
+
+            down_resp = await client.get(f"/api/v1/shares/{share_token}/download")
+            assert down_resp.status_code == 404
+            assert down_resp.json()["detail"] == "Share not found or expired"
+        cur.close()
+
+
+@pytest.mark.asyncio
+async def test_real_download_missing_minio_object(s3_client, db_conn):
+    """Test that missing S3 object returns 404 cleanly without exposing internals."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
+        files = {"file": ("ghost.txt", b"object will vanish", "text/plain")}
+        data = {"ttl": "1h"}
+        upload_resp = await client.post("/api/v1/shares", files=files, data=data)
+        assert upload_resp.status_code == 201
+        share_token = upload_resp.json()["share_url"].split("/s/")[-1]
+        token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
+
+        # Retrieve metadata first (which works via Postgres)
+        meta_resp = await client.get(f"/api/v1/shares/{share_token}")
+        assert meta_resp.status_code == 200
+
+        # Now delete object directly from MinIO bucket
+        cur = db_conn.cursor()
+        cur.execute("SELECT object_key FROM shares WHERE share_token_hash = %s", (token_hash,))
+        object_key = cur.fetchone()[0]
+        cur.close()
+
+        s3_client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=object_key)
+
+        # Download must return neutral 404
+        down_resp = await client.get(f"/api/v1/shares/{share_token}/download")
+        assert down_resp.status_code == 404
+        assert down_resp.json()["detail"] == "Share not found or expired"
+
+
+@pytest.mark.asyncio
+async def test_real_download_invalid_token():
+    """Test completely invalid token lookup against real database."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
+        meta_resp = await client.get("/api/v1/shares/completely_invalid_random_token_123")
+        assert meta_resp.status_code == 404
+        assert meta_resp.json()["detail"] == "Share not found or expired"
+
+        down_resp = await client.get("/api/v1/shares/completely_invalid_random_token_123/download")
+        assert down_resp.status_code == 404
+        assert down_resp.json()["detail"] == "Share not found or expired"
+
+
+@pytest.mark.asyncio
+async def test_real_download_concurrent_downloads(db_conn):
+    """Test multiple concurrent downloads maintaining data integrity and atomic counter."""
+    import asyncio
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
+        payload = b"Concurrent download payload block " * 500
+        expected_hash = hashlib.sha256(payload).hexdigest()
+        files = {"file": ("concurrent.txt", payload, "text/plain")}
+        data = {"ttl": "1h"}
+        upload_resp = await client.post("/api/v1/shares", files=files, data=data)
+        assert upload_resp.status_code == 201
+        share_token = upload_resp.json()["share_url"].split("/s/")[-1]
+        token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
+
+        # Fire 5 concurrent download requests
+        tasks = [
+            client.get(f"/api/v1/shares/{share_token}/download")
+            for _ in range(5)
+        ]
+        responses = await asyncio.gather(*tasks)
+
+        for resp in responses:
+            assert resp.status_code == 200
+            assert hashlib.sha256(resp.content).hexdigest() == expected_hash
+
+        # Verify atomic counter in DB reached exactly 5
+        cur = db_conn.cursor()
+        cur.execute("SELECT download_count FROM shares WHERE share_token_hash = %s", (token_hash,))
+        final_count = cur.fetchone()[0]
+        assert final_count == 5
+        cur.close()

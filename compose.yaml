@@ -48,6 +48,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       API_HOST: 0.0.0.0
       API_PORT: 8000
+      PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000","http://127.0.0.1:3000"]}
       POSTGRES_USER: ${POSTGRES_USER:-sendrift_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sendrift_local_password_only}
@@ -82,6 +83,9 @@ services:
       dockerfile: Dockerfile
     container_name: sendrift-worker
     command: ["python", "-m", "app.worker.cleanup"]
+    # The shared API image's HTTP probe does not apply to this non-HTTP process.
+    healthcheck:
+      disable: true
     environment:
       APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -109,9 +113,11 @@ services:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
+      # Next.js freezes rewrites during the production build, not container startup.
+      args:
+        INTERNAL_API_URL: http://api:8000
     container_name: sendrift-web
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
       PORT: 3000
     ports:
       - "3000:3000"
