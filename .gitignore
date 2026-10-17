@@ -2,6 +2,18 @@
 .env*
 !.env.example
 
+# Local credential files and database exports
+.aws/
+.ssh/
+*.pem
+*.key
+*.p12
+*.pfx
+backups/
+*.dump
+*.sql.gz
+*.log
+
 # Python
 __pycache__/
 *.py[cod]

@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sendrift_local_password_only}
       POSTGRES_DB: ${POSTGRES_DB:-sendrift}
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -27,8 +27,8 @@ services:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-sendrift_local_minio_access}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-sendrift_local_minio_secret_key}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -48,6 +48,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       API_HOST: 0.0.0.0
       API_PORT: 8000
+      PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000","http://127.0.0.1:3000"]}
       POSTGRES_USER: ${POSTGRES_USER:-sendrift_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sendrift_local_password_only}
@@ -63,7 +64,7 @@ services:
       S3_REGION: ${S3_REGION:-us-east-1}
       MAX_FILE_SIZE_BYTES: ${MAX_FILE_SIZE_BYTES:-104857600}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,6 +83,9 @@ services:
       dockerfile: Dockerfile
     container_name: sendrift-worker
     command: ["python", "-m", "app.worker.cleanup"]
+    # The shared API image's HTTP probe does not apply to this non-HTTP process.
+    healthcheck:
+      disable: true
     environment:
       APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -109,12 +113,14 @@ services:
     build:
       context: ../apps/web
       dockerfile: Dockerfile
+      # Next.js freezes rewrites during the production build, not container startup.
+      args:
+        INTERNAL_API_URL: http://api:8000
     container_name: sendrift-web
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
       PORT: 3000
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       api:
         condition: service_healthy

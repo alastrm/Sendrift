@@ -1,6 +1,8 @@
 # Sendrift — architecture v0.1
 
-**Status:** Proposed for MVP · **Pattern:** modular monolith · **Date:** 2026-10-11
+**Status:** Implemented local portfolio demo · **Pattern:** modular monolith · **Updated:** 2026-10-17
+
+Текущий scope — исходный код для публичного GitHub-портфолио и локальная демонстрация. Публичная эксплуатация не планируется. Требования к Internet-facing сервису ниже описывают ограничения и прежний проектный контекст, а не реализованную production-инфраструктуру.
 
 ## 1. Цели и решения
 
@@ -15,7 +17,7 @@ Sendrift передаёт файл по секретной ссылке. Усп�
 ```mermaid
 flowchart TD
   B[Browser / Next.js UI]
-  P[Reverse proxy / TLS / body limit / rate limit]
+  P[Next.js same-origin API proxy]
   A[FastAPI modular monolith]
   D[(PostgreSQL)]
   S[(Private MinIO / S3 bucket)]
@@ -23,14 +25,13 @@ flowchart TD
 
   B <--> P
   P -->|/api/v1/*| A
-  P -->|web pages| B
   A <--> D
   A <--> S
   W <--> D
   W <--> S
 ```
 
-Примечание: на диаграмме `Next.js UI` обозначает web-приложение, а `Browser` — его пользовательский клиент. Production proxy проксирует браузерные запросы к Next.js и FastAPI по разным путям одного origin. MinIO и PostgreSQL не доступны из публичной сети.
+Диаграмма показывает локальный Compose. Nginx, TLS и edge rate limiting в нём отсутствуют; файл Nginx в `infra/proxy` — только пример. Порты Next.js, FastAPI, PostgreSQL и MinIO опубликованы на `127.0.0.1` хоста.
 
 ### Зоны ответственности
 
@@ -41,7 +42,7 @@ flowchart TD
 | PostgreSQL | Метаданные и жизненный цикл записи, хеши токенов | Байты файла |
 | MinIO/S3 | Приватное хранение бинарных объектов | Решение, кому и сколько раз разрешено скачивание |
 | Cleanup worker | Идемпотентное удаление просроченных/зависших загрузок и восстановление после ошибок | Выдача пользователю доступа |
-| Reverse proxy | HTTPS, ограничение тела HTTP-запроса, базовая защита от abuse | Смысловая авторизация ссылок |
+| Nginx example (не запущен) | Пример маршрутизации и body limit; не готовый публичный edge | Смысловая авторизация ссылок |
 
 ## 3. API modules (один процесс/проект)
 
@@ -115,7 +116,7 @@ apps/api/
 
 Выдача `manage_token` только один раз. **Хранить/передавать его отдельно от `share_url`**. Frontend может удерживать его в рамках текущей клиентской сессии; восстановление удалённого секрета не предусмотрено. Не класть `manage_token` в URL, localStorage и стороннюю аналитику.
 
-Ошибки: `400` некорректная форма/TTL, `413` превышен размер, `429` ограничение частоты, `503` временно недоступно storage или другая серверная зависимость. Для сбоя DB/storage внутренние причины только в очищенных логах.
+Ошибки: `400` некорректная форма/TTL, `413` превышен размер, `503` временно недоступно storage или другая серверная зависимость. Rate limiting и ответ `429` для него не реализованы. Для сбоя DB/storage внутренние причины только в очищенных логах.
 
 ### `GET /shares/{share_token}`
 
@@ -160,7 +161,7 @@ stateDiagram-v2
 
 ### Загрузка
 
-1. Reverse proxy отвергает слишком большое тело запроса до обработки в Python; FastAPI дополнительно проверяет фактический размер.
+1. В локальном Compose Next.js проксирует тело в FastAPI; middleware приложения ограничивает полученные байты до multipart parsing, затем отдельно проверяется размер файла. Независимый edge body limit есть только в неиспользуемом примере Nginx.
 2. API валидирует единственный файл/TTL и создаёт запись `uploading`, генерирует два независимых 256-битных секрета и случайный `object_key`.
 3. Парсер `UploadFile` FastAPI использует spool-to-disk. **Не читать** весь файл через `await file.read()` без параметра. Библиотека записи объекта читает поток ограниченными порциями и подтверждает результат; при использовании блокирующего S3 SDK запускать операцию в threadpool.
 4. При ошибке лимита или storage → состояние `failed`/компенсирующее удаление; cleanup восстанавливает после аварии, включая orphan objects по `object_key` в незавершённых записях.
@@ -169,7 +170,7 @@ stateDiagram-v2
 
 После создания `uploading` API удерживает блокировку строки `FOR UPDATE` на время записи в S3 и до финализации. Cleanup пропускает эту строку через `SKIP LOCKED`, даже если загрузка длится дольше stale timeout. Финализация и отметка ошибки допускаются только из `uploading`; отмена запроса дожидается завершения блокирующего S3 thread перед освобождением блокировки/временного файла.
 
-Важно: FastAPI `UploadFile` уже может буферизовать тело запроса в память/временный диск. Поэтому размер HTTP тела, количество multipart полей, свободное место в tmp и таймауты также ограничены. `Content-Length` клиента недостаточен для валидации.
+Важно: FastAPI `UploadFile` буферизует тело запроса в память/временный диск. Middleware ограничивает полученные байты независимо от `Content-Length`, но не задаёт общую квоту tmp, лимит конкурентных запросов или deadline передачи. Next.js proxy также может удерживать тело в памяти. Подробности ограничений — в `SECURITY_AUDIT.md`.
 
 ### Просмотр и скачивание
 
@@ -187,7 +188,7 @@ stateDiagram-v2
 - Выбирает истёкшие `ready`, `deleting`, достаточно старые `failed` и зависшие `uploading`.
 - Атомарно переводит подходящие записи в `deleting` (пакетная блокировка/`FOR UPDATE SKIP LOCKED` при нескольких worker), удаляет объект из S3, после подтверждения удаляет строку DB.
 - Commit перехода в `deleting` освобождает блокировку: worker повторно захватывает строку с `SKIP LOCKED` и удерживает её до завершения S3 delete и DB delete/commit. После crash остаётся `deleting`; другой worker может безопасно повторить удаление. Stale timeout и grace period отсчитываются от `updated_at`, не `created_at`.
-- При ошибке удаления сохраняет `deleting`, повторяет с backoff. Зависшие `deleting` всегда доступны recovery.
+- При ошибке удаления сохраняет `deleting`, повторяет в следующем цикле. Отдельный экспоненциальный backoff не реализован. Зависшие `deleting` всегда доступны recovery.
 - Повторное удаление отсутствующего объекта считается успешным завершением.
 - Перед удалением объекта storage adapter прерывает незавершённые multipart uploads с этим точным ключом. Для этого S3 credentials должны разрешать `ListBucketMultipartUploads` и `AbortMultipartUpload`. Reconciliation также проверяет старые multipart uploads без DB записей; недавние и связанные с активной записью сохраняются. Ошибка удаления отдельного ключа оставляет `deleting` и не блокирует остальные записи текущего ограниченного пакета.
 - Дополнительно нужен редкий audit/reconciliation для объектов с отсутствующими записями (например, crash после S3 put, но до commit/создания DB ссылки).
@@ -198,23 +199,23 @@ stateDiagram-v2
 
 ### Основные риски
 
-| Угроза | Защита |
+| Угроза | Текущее состояние / ограничения |
 | --- | --- |
-| Угадывание share URLs | >=256-bit random secret, SHA-256 в БД, rate limit, никакого перечисления |
-| Кража токена через логи/referrer | redaction path/token, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, без сторонней аналитики на share page |
+| Угадывание share URLs | >=256-bit random secret, SHA-256 в БД, никакого перечисления; rate limiting не реализован |
+| Кража токена через логи/referrer | API redaction, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, без сторонней аналитики; известные пробелы proxy logging описаны в `SECURITY_AUDIT.md` |
 | Доступ напрямую к storage | приватный bucket, серверные credentials, нет публичной политики |
 | Path traversal / XSS от имени | случайный object key, имя только как данные, HTML-escaping, безопасный `Content-Disposition` |
 | HTML/SVG execution | всегда `attachment`, `application/octet-stream`, `nosniff`, не рендерить предпросмотр |
-| Resource exhaustion | limit 100 MiB + proxy limit, multipart constraints, timeouts, rate/quota на общих ресурсах |
-| DDoS/abuse/illegal files | на публичном окружении отдельные лимиты и антиабьюз, приём жалоб, политика удаления, сканирование/контроль риска |
-| Непредвиденное раскрытие | Secrets not in logs/DB plaintext; TLS; production configs |
+| Resource exhaustion | 100 MiB на файл и middleware body limit; aggregate quotas, concurrency limits и transfer deadlines не реализованы |
+| DDoS/abuse/illegal files | Отдельных operational abuse controls и malware scanning нет; публичная эксплуатация вне scope |
+| Непредвиденное раскрытие | Хеши вместо plaintext tokens в БД, loopback host ports; локальный HTTP без TLS |
 | Stale/expired records | UTC server checks + idempotent worker, no blind trust in cron |
 
 Сервис **не обладает сквозным шифрованием**. Администратор storage с достаточными правами потенциально может видеть байты файла. Не рекламировать хранение как конфиденциальное в криптографическом смысле.
 
-### Лимиты и публичная эксплуатация
+### Не реализованные требования к публичной эксплуатации (вне scope)
 
-- `100 MiB` — логический предел файла, а предел HTTP тела у proxy чуть выше из-за multipart overhead.
+- `100 MiB` — реализованный предел файла; middleware body limit чуть выше из-за multipart overhead. Edge body limit в Compose отсутствует.
 - На уровне gateway: rate limiting upload и download, concurrency limits, timeouts, запрет чрезмерно больших request bodies.
 - На уровне backend: квоты с учётом общих данных, а не памяти отдельного процесса; лимиты одновременных передач.
 - Для **публичного** анонимного сервиса обязательно решить: malware scanning/quarantine до выдачи ссылок, правообладательские и abuse complaints, условия использования, удаление по жалобам, контроль storage/egress bills и оповещения о расходах.
@@ -222,7 +223,9 @@ stateDiagram-v2
 
 ## 8. Deploy topology
 
-**Local development**: Docker Compose: `web`, `api`, `postgres`, `minio`, `worker`, опционально `proxy`. Бакет создаётся локальной командой и остаётся приватным. `.env.example` содержит лишь вымышленные значения. Реальный `.env` в `.gitignore`.
+**Local development**: Docker Compose: `web`, `api`, `postgres`, `minio`, `worker`. На старте API создаёт отсутствующий бакет и проверяет его приватность. Миграции Alembic запускаются отдельно. `.env.example` содержит лишь вымышленные локальные credentials; `.env` исключён из Git, что само по себе не доказывает отсутствие секретов в истории.
+
+Все host bindings ограничены `127.0.0.1`. PostgreSQL публикуется на `POSTGRES_PORT` (по умолчанию 5433); внутри сети Compose всегда используется `postgres:5432`. Именованные volumes сохраняются при остановке и пересоздании контейнеров. Основной entry point — корневой `compose.yaml`; копия в `infra` сохраняет те же локальные настройки с относительными build contexts.
 
 Next.js проксирует `/api/*` и `/health/*` в FastAPI. `INTERNAL_API_URL` — серверный
 адрес, фиксируемый при `next build`: Compose передаёт build argument
@@ -240,7 +243,7 @@ Worker использует общий API image, но не обслуживае
 healthcheck отключён в Compose. Это не проверка прогресса cleanup; его подтверждают
 логи завершённых циклов и наблюдение за удалением отозванных файлов.
 
-**Small production**: reverse proxy с TLS → Next.js и FastAPI → managed PostgreSQL и приватный S3-compatible bucket → тот же cleanup worker. Никакого публичного доступа к БД и S3 credentials в браузере. Статусные endpoints не раскрывают конфигурацию.
+**Прежний вариант Small production (вне текущего scope, не реализован):** reverse proxy с TLS → Next.js и FastAPI → managed PostgreSQL и приватный S3-compatible bucket → тот же cleanup worker. Это не инструкция по безопасному публичному развёртыванию.
 
 Мониторинг: частота ошибок загрузки, 4xx/5xx без токенов, задержки API, storage usage, число застрявших `uploading/deleting`, успех cleanup, стоимость исходящего трафика. События не должны раскрывать имена файлов и токены без необходимости.
 
@@ -279,6 +282,7 @@ Presigned S3 URL — bearer credential: пока действует, обычн�
 | ADR-005 | Hashed 256-bit bearer tokens | Минимизирует ущерб от утечки базы |
 | ADR-006 | Dedicated cleanup worker without queue | Достаточно на старте; eventual physical deletion |
 | ADR-007 | No one-time/download limits in MVP | Не обещать семантику, которую сложно гарантировать при конкуренции |
+| ADR-008 | Local-only portfolio project (2026-10-17) | Публичный исходный код, без публичного сервиса; Compose ports только на loopback, production-инфраструктура вне scope |
 
 ## 12. Официальные материалы
 
